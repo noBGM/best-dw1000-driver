@@ -1,0 +1,97 @@
+/ {
+    // 你需要找到你的 SPI 控制器节点，例如 &spi0, &spi1, &spi_master 等
+    // 然后将下面的 dw1000_node 添加为其子节点。
+
+    /*
+    // 示例：如果您的 SPI 控制器节点是 &spi0
+    &spi0 {
+        status = "okay"; // 确保 SPI 控制器本身是启用的
+
+        // ... 其他可能已存在的 SPI 设备 ...
+
+        dw1000_node: dw1000@0 { // "dw1000@0" 中的 "0" 通常是片选索引
+            compatible = "qorvo,dw1000-generic-hybrid", "qorvo,dw1000-generic"; // 确保与驱动的 of_match_table 匹配
+            reg = <0>; // SPI 片选 (Chip Select) 索引，例如 0, 1, 2...
+
+            spi-max-frequency = <8000000>; // SPI 最大时钟频率 (例如 8MHz)
+                                          // 根据您的硬件和 DW1000 规格调整
+
+            // SPI FIFO 物理地址 - 必须根据具体硬件平台的 SPI 控制器寄存器映射进行设置
+            // 这些地址通常可以在 SPI 控制器的数据手册或板级设备树中找到
+            qorvo,spi-tx-fifo-phys = <0x12345678>; // 替换为实际的 TX FIFO 物理地址
+            qorvo,spi-rx-fifo-phys = <0x87654321>; // 替换为实际的 RX FIFO 物理地址
+
+            // 中断引脚连接
+            // 将 <&gpio_controller GPIO_PIN_NUMBER IRQ_TYPE_EDGE_RISING>
+            // 替换为实际的 GPIO 控制器节点、引脚号和中断触发类型。
+            // 例如: interrupt-parent = <&gpio0>; interrupts = <25 IRQ_TYPE_EDGE_RISING>;
+            interrupt-parent = <&gpio_controller_label>; // 例如 &gpio0, &gpio1 等
+            interrupts = <GPIO_PIN_NUMBER IRQ_TYPE_EDGE_RISING>; // 例如 17 IRQ_TYPE_EDGE_RISING
+
+            // 复位引脚连接 (可选, 如果在硬件设计中使用了)
+            // 将 <&gpio_controller GPIO_PIN_NUMBER_RSTN GPIO_ACTIVE_LOW>
+            // 替换为实际的 GPIO 控制器节点、引脚号和有效电平。
+            // 例如: rstn-gpios = <&gpio0 26 GPIO_ACTIVE_LOW>;
+            rstn-gpios = <&gpio_controller_label GPIO_PIN_NUMBER_RSTN GPIO_ACTIVE_LOW>; // 例如 GPIO_ACTIVE_LOW 或 GPIO_ACTIVE_HIGH
+
+            // 如果有其他 GPIOs, 例如 WAKEUP pin:
+            // wakeup-gpios = <&gpio_controller_label GPIO_PIN_NUMBER_WAKEUP GPIO_ACTIVE_HIGH>;
+
+            // 可选的设备特定属性，例如
+            qorvo,default-channel = <5>;
+            qorvo,default-prf = <1>; // 0=16MHz, 1=64MHz
+            qorvo,default-data-rate = <0>; // 0=110k, 1=850k, 2=6.8M
+            qorvo,default-tx-power = <0x0E>; // 默认TX功率寄存器值
+
+            status = "okay"; // 启用此设备节点
+        };
+    };
+    */
+};
+
+/*
+ * 如何使用此文件:
+ *
+ * 1. 确定您的目标板卡的顶层设备树文件 (.dts)。
+ * 2. 在该 .dts 文件中，使用 #include "dw1000_device.dtsi" (或正确的相对路径) 来包含此文件。
+ *    通常 #include 指令放在 .dts 文件的开头附近。
+ * 3. 在您的顶层 .dts 文件中，找到您的 SPI 主控制器节点 (例如 &spi0, &ecspi1, &spi_master 等)。
+ * 4. 将 dw1000_node (或您重命名的节点标签) 的内容（从 compatible 开始）
+ *    正确地放置为该 SPI 主控制器的子节点。
+ * 5. 根据您的硬件原理图，仔细修改以下占位符/示例值：
+ *    - SPI 控制器节点标签 (例如 &spi0)
+ *    - `reg = <CS_INDEX>;` (片选索引)
+ *    - `spi-max-frequency`
+ *    - `interrupt-parent` 和 `interrupts` (GPIO控制器, 引脚号, 触发类型)
+ *    - `rstn-gpios` (如果使用)
+ *    - 其他自定义属性 (如果需要)
+ * 6. 确保所有引用的 GPIO 控制器节点 (如 &gpio0) 在您的板卡 .dts 文件中是定义好的并且是启用的。
+ * 7. 编译您的设备树。
+ *
+ * 示例 (在您的板卡 a_specific_board.dts 文件中):
+ *
+ * #include "dw1000_device.dtsi" // 假设 dw1000_device.dtsi 在同一目录或include路径中
+ *
+ * / {
+ *     // ... 其他板卡描述 ...
+ * };
+ *
+ * &spi0 { // 假设这是您的目标SPI控制器
+ *     status = "okay";
+ *     // ... 其他SPI设备 ...
+ *
+ *     dw1000_on_spi0: dw1000@0 { // 给节点一个唯一的标签，例如 dw1000_on_spi0
+ *         compatible = "qorvo,dw1000-generic-hybrid", "qorvo,dw1000-generic";
+ *         reg = <0>; // 使用 SPI0 的 CS0
+ *         spi-max-frequency = <8000000>;
+ *
+ *         interrupt-parent = <&gpio0>; // 假设中断连接到 GPIO 控制器 0
+ *         interrupts = <15 IRQ_TYPE_EDGE_RISING>; // 假设连接到 GPIO0 的第 15 脚
+ *
+ *         rstn-gpios = <&gpio0 16 GPIO_ACTIVE_LOW>; // 假设复位连接到 GPIO0 的第 16 脚
+ *
+ *         status = "okay";
+ *     };
+ * };
+ *
+ */ 
