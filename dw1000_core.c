@@ -92,49 +92,37 @@ int dw1000_hybrid_net_stop(struct net_device *netdev)
 // 网络设备发送数据包
 int dw1000_hybrid_net_start_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
-    struct dw1000_hybrid_priv *priv = netdev_priv(netdev);
-    struct dw1000_tx_frame *tx_frame;
-    unsigned long flags;
-    int ret;
+	struct dw1000_hybrid_priv *priv = netdev_priv(netdev);
+	unsigned long flags;
+	int ret;
 
-    // 检查是否有足够的发送描述符
-    if (atomic_read(&priv->tx_pending_count) >= MAX_PENDING_TX) {
-        netif_stop_queue(netdev);
-        return NETDEV_TX_BUSY;
-    }
+	// 如果待处理的TX计数超过或等于最大值，则停止队列并返回BUSY
+	if (atomic_read(&priv->tx_pending_count) >= MAX_PENDING_TX) {
+		netif_stop_queue(netdev);
+		dev_warn_ratelimited(&priv->spi->dev, "TX busy, stopping queue\n");
+		return NETDEV_TX_BUSY;
+	}
 
-    // 分配发送帧
-    tx_frame = kzalloc(sizeof(struct dw1000_tx_frame) + skb->len, GFP_ATOMIC);
-    if (!tx_frame) {
-        dev_err(&priv->spi->dev, "无法分配发送帧\n");
-        return NETDEV_TX_BUSY;
-    }
+	// 直接调用底层发送函数，将skb传递给它
+	// lowlevel_tx 将会处理描述符的获取和数据填充
+	// skb的所有权在成功提交后转移给驱动（最终在DMA回调中释放）
+	ret = dw1000_hybrid_lowlevel_tx(priv, skb->data, skb->len, skb);
+	if (ret) {
+		// 如果lowlevel_tx失败（很可能是因为没有可用的描述符），
+		// 我们停止队列，并告诉网络核心稍后重试。
+		// skb不会被释放，网络核心会保留它。
+		netif_stop_queue(netdev);
+		return NETDEV_TX_BUSY;
+	}
 
-    // 准备发送帧
-    tx_frame->len = skb->len;
-    tx_frame->wait_resp = 0;
-    tx_frame->tx_mode = 0;
-    memcpy(tx_frame->data, skb->data, skb->len);
+	// 发送成功
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	priv->stats.tx_packets++;
+	priv->stats.tx_bytes += skb->len;
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
 
-    // 发送帧
-    ret = dw1000_send_frame(priv, tx_frame);
-    kfree(tx_frame);
-
-    if (ret) {
-        dev_err(&priv->spi->dev, "发送帧失败: %d\n", ret);
-        return NETDEV_TX_BUSY;
-    }
-
-    // 更新统计信息
-    spin_lock_irqsave(&priv->stats_lock, flags);
-    priv->stats.tx_packets++;
-    priv->stats.tx_bytes += skb->len;
-    spin_unlock_irqrestore(&priv->stats_lock, flags);
-
-    // 释放SKB
-    dev_kfree_skb(skb);
-
-    return NETDEV_TX_OK;
+	// TX完成回调函数现在负责释放skb并唤醒队列
+	return NETDEV_TX_OK;
 }
 
 // --- 共享TX辅助函数 --- 
@@ -143,90 +131,44 @@ static int dw1000_hybrid_lowlevel_tx(struct dw1000_hybrid_priv *priv,
                                    size_t frame_len, 
                                    struct sk_buff *skb_to_free)
 {
-    struct dw1000_tx_desc *desc;
-    int ret;
+	struct dw1000_tx_desc *desc;
+	int ret;
 
-    // 1. 获取空闲的TX描述符
-    desc = dw1000_get_free_tx_desc(priv);
-    if (!desc) {
-        dev_warn_ratelimited(&priv->spi->dev, "lowlevel_tx没有可用的TX描述符\n");
-        // 如果提供了skb，由于无法发送需要释放它
-        if (skb_to_free) {
-            dev_kfree_skb_any(skb_to_free);
-        }
-        return -EBUSY;
-    }
+	// 1. 获取空闲的TX描述符
+	desc = dw1000_get_free_tx_desc(priv);
+	if (!desc) {
+		dev_warn_ratelimited(&priv->spi->dev, "lowlevel_tx没有可用的TX描述符\n");
+		return -EBUSY;
+	}
 
-    // 2. 检查帧长度是否超过描述符缓冲区大小
-    if (frame_len == 0 || frame_len > desc->buffer_size) {
-        dev_err(&priv->spi->dev, "Lowlevel_tx: 无效的帧长度 %zu 对于缓冲区大小 %zu\n", 
-                frame_len, desc->buffer_size);
-        dw1000_put_tx_desc_on_error(desc); // 将描述符返回到空闲列表
-        if (skb_to_free) {
-            dev_kfree_skb_any(skb_to_free);
-        }
-        return -EINVAL;
-    }
+	// 2. 检查帧长度是否超过描述符缓冲区大小
+	if (frame_len == 0 || frame_len > desc->buffer_size) {
+		dev_err(&priv->spi->dev, "Lowlevel_tx: 无效的帧长度 %zu 对于缓冲区大小 %zu\n",
+			frame_len, desc->buffer_size);
+		dw1000_put_tx_desc_on_error(desc); // 将描述符返回到空闲列表
+		return -EINVAL;
+	}
     
-    // 3. 将帧数据复制到描述符的缓冲区
-    memcpy(desc->buffer, frame_data, frame_len);
+	// 3. 将帧数据复制到描述符的缓冲区
+	memcpy(desc->buffer, frame_data, frame_len);
 
-    // 4. 设置描述符字段
-    desc->data_len = frame_len;
-    desc->skb = skb_to_free; // 关联SKB以便回调时释放(如果有)
+	// 4. 设置描述符字段
+	desc->data_len = frame_len;
+	desc->skb = skb_to_free; // 关联SKB以便回调时释放(如果有)
 
-    // 5. 调用execute_tx辅助函数处理硬件配置和DMA提交
-    ret = dw1000_execute_tx(priv, desc);
-    if (ret) {
-        // dw1000_execute_tx失败
-        // 如果在DMA提交前失败，tx_pending_count会被它递减
-        // 如果在DMA提交后失败(例如TXSTRT命令)，DMA处于挂起状态
-        // dw1000_execute_tx failed. 
-        // If it failed *before* DMA submission, tx_pending_count was decremented by it.
-        // If it failed *after* DMA submission (e.g. TXSTRT command), DMA is pending.
-        // The descriptor is NOT on the tx_pending_list if dw1000_submit_tx_desc failed.
-        // The descriptor IS on the tx_pending_list if only TXSTRT failed.
+	// 5. 调用execute_tx辅助函数处理硬件配置和DMA提交
+	ret = dw1000_execute_tx(priv, desc);
+	if (ret) {
+		// 如果dw1000_execute_tx失败，意味着DMA提交未成功。
+		// 我们必须将描述符放回空闲列表。
+		// 注意：我们 **不** 在这里释放skb。如果这是一个网络数据包，
+		// 调用者(ndo_start_xmit)会返回NETDEV_TX_BUSY，网络核心会保留skb。
+		dev_err(&priv->spi->dev, "dw1000_execute_tx failed with %d in lowlevel_tx\n", ret);
+		dw1000_put_tx_desc_on_error(desc);
+		return ret;
+	}
 
-        // Regardless, if execute_tx returns an error, we need to clean up here.
-        // The descriptor should be returned to free_list ONLY if DMA was NOT successfully submitted.
-        // dw1000_execute_tx handles atomic_dec if submit_tx_desc fails.
-        // If submit_tx_desc succeeded but TXSTRT failed, desc is on pending_list, callback will clean it.
-        // So, only call put_tx_desc_on_error if submit_tx_desc within execute_tx failed.
-        // This is tricky. Let's assume execute_tx ensures desc is not on pending list if it returns error for pre-TXSTRT issues.
-
-        // Simpler: If execute_tx returns error, it means the TX sequence was not fully successful.
-        // The descriptor itself should be put back on the free list by the caller of execute_tx if DMA submission failed. 
-        // dw1000_execute_tx already decremented tx_pending_count if dma_submit_tx_desc failed.
-        // If only TXSTRT failed, desc is on pending_list and callback will handle it.
-        // We only need to free the skb here and ensure desc is put back if not handled by callback.
-
-        dev_err(&priv->spi->dev, "dw1000_execute_tx failed with %d in lowlevel_tx\n", ret);
-        
-        // Check if the descriptor is on the pending list. If not, it means DMA submission likely failed or was not attempted.
-        // This requires checking list status, which adds complexity. 
-        // A robust way: dw1000_execute_tx should guarantee that if it returns an error where DMA isn't pending,
-        // the descriptor isn't on tx_pending_list. And tx_pending_count is correct.
-
-        // For now, assume if dw1000_execute_tx fails, the descriptor state is such that
-        // it should be returned to free list (unless it was due to TXSTRT failing post-DMA-submit).
-        // The current dw1000_execute_tx logic: if dw1000_submit_tx_desc fails, it returns error, atomic_dec occurs.
-        // Caller (this function) must put desc to free list.
-        // If dw1000_submit_tx_desc succeeds but TXSTRT fails, desc IS on pending list. Callback handles.
-
-        if (ret != -EAGAIN) { // Errors typically from submit_tx_desc or pre-submit checks
-			dw1000_put_tx_desc_on_error(desc);
-			// Else (e.g. error from TXSTRT), descriptor is on pending list, callback will free.
-
-			if (desc->skb) { // Check desc->skb as skb_to_free might be different if logic changes
-				dev_kfree_skb_any(desc->skb);
-				desc->skb = NULL; // Important as descriptor might be reused from free list
-			}
-
-		} 
-        return ret;
-    }
-
-    return 0; // Success
+	return 0; // Success
 }
 // --- Character Device Write Implementation (优化后) ---
 static ssize_t dw1000_hybrid_cdev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
@@ -349,6 +291,9 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	// 初始化原子变量
 	atomic_set(&priv->tx_pending_count, 0);
 	atomic_set(&priv->tx_sequence_num, 0);
+	atomic_set(&priv->cdev_open_count, 0);
+	atomic_set(&priv->mmap_ref_count, 0);
+
 
 	// 初始化默认配置 (使用 dw1000_hybrid_config)
 	priv->config.channel = 5;          // 默认使用信道5
@@ -378,18 +323,18 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	// 初始化NAPI
 	netif_napi_add(netdev, &priv->napi, dw1000_hybrid_poll, NAPI_WEIGHT);
 
-	// 获取中断GPIO
+	// 获取中断GPIO (devm_*函数会自动管理资源)
 	priv->irq_gpio = devm_gpiod_get_optional(&spi->dev, "irq", GPIOD_IN);
 	if (IS_ERR(priv->irq_gpio)) {
 		ret = PTR_ERR(priv->irq_gpio);
 		dev_err(&spi->dev, "获取IRQ GPIO失败: %d\n", ret);
-		goto cleanup_napi;
+		goto err_napi;
 	}
 
 	if (!priv->irq_gpio) {
 		dev_err(&spi->dev, "在设备树中未找到或未指定IRQ GPIO。\n");
 		ret = -ENODEV;
-		goto cleanup_napi;
+		goto err_napi;
 	}
 
 	// 获取并验证IRQ号
@@ -397,19 +342,19 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	if (irq_num_local <= 0) {
 		dev_err(&spi->dev, "从GPIO获取有效IRQ号失败: %d\n", irq_num_local);
 		ret = irq_num_local < 0 ? irq_num_local : -EINVAL;
-		goto cleanup_napi;
+		goto err_napi;
 	}
 	priv->irq_num = irq_num_local;
 	dev_info(&spi->dev, "使用来自GPIO的IRQ号 %d\n", priv->irq_num);
 
-	// 请求共享中断
+	// 请求共享中断 (devm_*函数会自动管理资源)
 	ret = devm_request_irq(&spi->dev, priv->irq_num,
 			      dw1000_hybrid_irq_handler,
 			      IRQF_TRIGGER_RISING | IRQF_SHARED,
 			      DRIVER_NAME, priv);
 	if (ret) {
 		dev_err(&spi->dev, "IRQ请求失败: %d\n", ret);
-		goto cleanup_napi;
+		goto err_napi;
 	}
 	disable_irq(priv->irq_num); // 在设备打开前禁用中断
 
@@ -417,7 +362,7 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	ret = alloc_chrdev_region(&priv->cdev_devt, 0, 1, "dw1000_sensor");
 	if (ret < 0) {
 		dev_err(&spi->dev, "字符设备区域分配失败: %d\n", ret);
-		goto cleanup_napi;
+		goto err_napi;
 	}
 	
 	// 初始化并添加字符设备
@@ -426,7 +371,7 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	ret = cdev_add(&priv->cdev, priv->cdev_devt, 1);
 	if (ret) {
 		dev_err(&spi->dev, "cdev_add失败: %d\n", ret);
-		goto cleanup_chrdev_region;
+		goto err_alloc_chrdev;
 	}
 	
 	// 创建字符设备类/节点
@@ -434,14 +379,14 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	if (IS_ERR(priv->cdev_class)) {
 		ret = PTR_ERR(priv->cdev_class);
 		dev_err(&spi->dev, "创建设备类失败: %d\n", ret);
-		goto cleanup_cdev;
+		goto err_cdev_add;
 	}
 
 	if (!device_create(priv->cdev_class, &spi->dev, priv->cdev_devt, 
 			  priv, "dw1000_sensor%d", MINOR(priv->cdev_devt))) {
 		dev_err(&spi->dev, "创建设备节点失败\n");
 		ret = -ENOMEM;
-		goto cleanup_class;
+		goto err_class_create;
 	}
 	
 	// 初始化等待队列和kfifo
@@ -453,63 +398,39 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	if (!priv->sensing_buffer) {
 		dev_err(&spi->dev, "分配传感缓冲区失败\n");
 		ret = -ENOMEM;
-		goto cleanup_kfifo;
+		goto err_device_create;
 	}
 
 	// 使用分配的缓冲区初始化 kfifo
 	if (kfifo_alloc(&priv->sensing_fifo, priv->sensing_buffer_size, GFP_KERNEL)) {
 		dev_err(&spi->dev, "分配kfifo失败\n");
 		ret = -ENOMEM;
-		goto cleanup_sensing_buffer;
+		goto err_vmalloc;
 	}
-
-	// 设置DMA缓冲区大小 (这些是描述符负载缓冲区，确保在dw1000_generic.h中定义正确)
-	// priv->tx_dma_buf_size = DW1000_DEFAULT_TX_DMA_BUF_SIZE; // 示例: DEFAULT_TX_DESC_BUF_SIZE
-	// priv->rx_dma_buf_size = DW1000_DEFAULT_RX_DMA_BUF_SIZE; // 示例: DEFAULT_RX_DESC_BUF_SIZE
 	
-	// 申请DMA通道
+	// 设置DMA能力掩码
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_SLAVE, mask);
 	
-	// 获取SPI控制器的物理地址 - 移除旧逻辑
-	// struct resource *res;
-	// phys_addr_t spi_phys_addr = 0;
-	
-	// 尝试从SPI控制器的父设备获取物理地址 - 移除旧逻辑
-	// res = platform_get_resource(to_platform_device(spi->controller->dev.parent),
-	// IORESOURCE_MEM, 0);
-	// if (!res) {
-	// dev_err(&spi->dev, "获取SPI控制器物理地址失败\n");
-	// ret = -ENODEV;
-	// goto cleanup_ring_buffer; // 应该是cleanup_kfifo或类似的
-	// }
-	// spi_phys_addr = res->start;
-	// dev_info(&spi->dev, "SPI控制器物理地址: 0x%llx\n", 
-	// (unsigned long long)spi_phys_addr);
-
-	// 定义SPI控制器寄存器偏移量 - 移除硬编码定义
-	// #define SPI_TXDR_OFFSET 0x400  // TX数据寄存器偏移量
-	// #define SPI_RXDR_OFFSET 0x800  // RX数据寄存器偏移量
-
 	phys_addr_t tx_fifo_phys = 0;
 	phys_addr_t rx_fifo_phys = 0;
 
 	if (!spi->dev.of_node) {
 		dev_err(&spi->dev, "未找到设备树节点\n");
 		ret = -EINVAL;
-		goto cleanup_kfifo; // 更新标签
+		goto err_kfifo;
 	}
 
-	ret = device_property_read_u64(spi->dev.of_node, "qorvo,spi-tx-fifo-phys", &tx_fifo_phys);
+	ret = device_property_read_u64(&spi->dev, "qorvo,spi-tx-fifo-phys", &tx_fifo_phys);
 	if (ret) {
 		dev_err(&spi->dev, "读取'qorvo,spi-tx-fifo-phys'属性失败: %d\n", ret);
-		goto cleanup_kfifo; // 更新标签
+		goto err_kfifo;
 	}
 
-	ret = device_property_read_u64(spi->dev.of_node, "qorvo,spi-rx-fifo-phys", &rx_fifo_phys);
+	ret = device_property_read_u64(&spi->dev, "qorvo,spi-rx-fifo-phys", &rx_fifo_phys);
 	if (ret) {
 		dev_err(&spi->dev, "读取'qorvo,spi-rx-fifo-phys'属性失败: %d\n", ret);
-		goto cleanup_kfifo; // 更新标签
+		goto err_kfifo;
 	}
 	
 	dev_info(&spi->dev, "从DT使用TX FIFO地址: 0x%llx, RX FIFO地址: 0x%llx\n",
@@ -520,7 +441,7 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	if (!priv->rx_dma_chan) {
 		dev_err(&spi->dev, "请求RX DMA通道失败\n");
 		ret = -ENODEV;
-		goto cleanup_kfifo; // 更新标签
+		goto err_kfifo;
 	}
 
 	// TX DMA通道
@@ -528,7 +449,7 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	if (!priv->tx_dma_chan) {
 		dev_err(&spi->dev, "请求TX DMA通道失败\n");
 		ret = -ENODEV;
-		goto cleanup_rx_dma_chan;
+		goto err_req_rx_chan;
 	}
 
 	// 配置RX DMA通道
@@ -541,7 +462,7 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	ret = dmaengine_slave_config(priv->rx_dma_chan, &rx_dma_cfg);
 	if (ret) {
 		dev_err(&spi->dev, "配置RX DMA通道失败: %d\n", ret);
-		goto cleanup_rx_dma_chan; // 修正此失败点的标签
+		goto err_req_tx_chan;
 	}
 
 	// 配置TX DMA通道
@@ -554,7 +475,7 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	ret = dmaengine_slave_config(priv->tx_dma_chan, &tx_dma_cfg);
 	if (ret) {
 		dev_err(&spi->dev, "配置TX DMA通道失败: %d\n", ret);
-		goto cleanup_tx_dma_chan; 
+		goto err_req_tx_chan; 
 	}
 
 	// 初始化DW1000硬件
@@ -562,35 +483,35 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 	ret = dw1000_reset_device(priv);
 	if (ret) {
 		dev_err(&spi->dev, "设备复位失败: %d\n", ret);
-		goto cleanup_dma_channels;
+		goto err_req_tx_chan;
 	}
 
 	// 2. 执行额外的硬件初始化（中断掩码等）
 	ret = dw1000_hw_init(priv);
 	if (ret) {
 		dev_err(&spi->dev, "硬件初始化失败: %d\n", ret);
-		goto cleanup_dma_channels;
+		goto err_req_tx_chan;
 	}
 
 	// 初始化 TX DMA 描述符
 	ret = dw1000_setup_tx_desc(priv);
 	if (ret) {
 		dev_err(&spi->dev, "设置TX DMA描述符失败: %d\n", ret);
-		goto cleanup_dma_channels;
+		goto err_req_tx_chan;
 	}
 
 	// 设置初始RX DMA
 	ret = dw1000_setup_rx_dma(priv);
 	if (ret) {
 		dev_err(&spi->dev, "设置RX DMA失败: %d\n", ret);
-		goto cleanup_tx_desc_and_channels;
+		goto err_setup_tx;
 	}
 
 	// 注册网络设备
 	ret = register_netdev(netdev);
 	if (ret) {
 		dev_err(&spi->dev, "注册netdev失败: %d\n", ret);
-		goto cleanup_rx_tx_desc_and_channels;
+		goto err_setup_rx;
 	}
 
 	dev_info(&spi->dev, "DW1000通用混合驱动探测成功! (网络: %s, 字符设备: %d:%d)\n",
@@ -598,36 +519,28 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 
 	return 0;
 
-cleanup_rx_tx_desc_and_channels:
+err_setup_rx:
 	dw1000_teardown_rx_dma(priv);
-cleanup_tx_desc_and_channels:
+err_setup_tx:
 	dw1000_cleanup_tx_desc(priv);
-cleanup_dma_channels:
-	if (priv->tx_dma_chan)
-		dma_release_channel(priv->tx_dma_chan);
-cleanup_rx_dma_chan: // 添加此标签以提高清晰度
-	if (priv->rx_dma_chan)
-		dma_release_channel(priv->rx_dma_chan);
-cleanup_kfifo: // kfifo_alloc分配的新标签
+err_req_tx_chan:
+	dma_release_channel(priv->tx_dma_chan);
+err_req_rx_chan:
+	dma_release_channel(priv->rx_dma_chan);
+err_kfifo:
 	kfifo_free(&priv->sensing_fifo);
-cleanup_sensing_buffer: // vmalloc的原始标签
-	if (priv->sensing_buffer) {
-		vfree(priv->sensing_buffer);
-		priv->sensing_buffer = NULL;
-	}
-cleanup_device:
-	if (priv->cdev_class && !IS_ERR(priv->cdev_class))
-		device_destroy(priv->cdev_class, priv->cdev_devt);
-cleanup_class:
-	if (priv->cdev_class && !IS_ERR(priv->cdev_class))
-		class_destroy(priv->cdev_class);
-cleanup_cdev:
+err_vmalloc:
+	vfree(priv->sensing_buffer);
+err_device_create:
+	device_destroy(priv->cdev_class, priv->cdev_devt);
+err_class_create:
+	class_destroy(priv->cdev_class);
+err_cdev_add:
 	cdev_del(&priv->cdev);
-cleanup_chrdev_region:
+err_alloc_chrdev:
 	unregister_chrdev_region(priv->cdev_devt, 1);
-cleanup_napi:
+err_napi:
 	netif_napi_del(&priv->napi);
-cleanup_free_netdev:
 	free_netdev(netdev);
 	return ret;
 }
@@ -672,8 +585,15 @@ static int dw1000_generic_hybrid_remove(struct spi_device *spi)
 
     // 4. 清理字符设备资源
     if (priv->sensing_buffer) {
-        // 确保没有正在进行的 mmap 操作
-        msleep(100); // 给时间让所有 VM 操作完成
+        // 等待所有mmap引用计数归零，而不是使用不可靠的msleep
+		timeout = 1000; // 等待最多1秒
+		while (atomic_read(&priv->mmap_ref_count) > 0 && timeout > 0) {
+			msleep(1);
+			timeout--;
+		}
+		if (atomic_read(&priv->mmap_ref_count) > 0) {
+			dev_warn(&spi->dev, "mmap引用计数在移除时未归零！\n");
+		}
         
         // 清理 kfifo
         kfifo_free(&priv->sensing_fifo);
@@ -865,29 +785,30 @@ static __poll_t dw1000_hybrid_cdev_poll(struct file *filp, poll_table *wait)
 // 字符设备内存映射函数
 static int dw1000_hybrid_cdev_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-    struct dw1000_hybrid_priv *priv = filp->private_data;
-    unsigned long size = vma->vm_end - vma->vm_start;
-    
-    // 检查映射大小是否超过缓冲区
-    if (size > priv->sensing_buffer_size) {
-        return -EINVAL;
-    }
-    
-    // 设置 VM 操作
-    vma->vm_ops = &dw1000_vm_ops;
-    vma->vm_private_data = priv;
-    
-    // 映射内核缓冲区
-    if (remap_pfn_range(vma, 
-                        vma->vm_start, 
-                        virt_to_phys(priv->sensing_buffer) >> PAGE_SHIFT,
-                        size, 
-                        vma->vm_page_prot)) {
-        return -EAGAIN;
-    }
-    
-    dw1000_vm_open(vma);
-    return 0;
+	struct dw1000_hybrid_priv *priv = filp->private_data;
+	unsigned long size = vma->vm_end - vma->vm_start;
+
+	// 检查映射大小是否超过缓冲区
+	if (size > priv->sensing_buffer_size) {
+		return -EINVAL;
+	}
+
+	/*
+	 * 对于vmalloc分配的内存，不能使用remap_pfn_range。
+	 * 正确的方法是提供一个 .fault 处理程序。
+	 * 当用户空间第一次访问内存时，会触发缺页异常，
+	 * 然后我们的 .fault 函数 (dw1000_vm_fault) 会被调用，
+	 * 它会找到正确的物理页面并建立映射。
+	 */
+
+	// 设置 VM 操作
+	vma->vm_ops = &dw1000_vm_ops;
+	vma->vm_private_data = priv;
+
+	// 为VMA打开操作调用我们的自定义函数（用于引用计数）
+	dw1000_vm_open(vma);
+
+	return 0;
 }
 
 // --- 字符设备IOCTL (添加了统计锁) ---
@@ -1133,12 +1054,11 @@ static const struct file_operations dw1000_hybrid_cdev_fops = {
 };
 
 // --- 网络设备操作结构体 ---
-static const struct net_device_ops dw1000_hybrid_netdev_ops = {
-	.ndo_open = dw1000_hybrid_net_open,
-	.ndo_stop = dw1000_hybrid_net_stop,
-	.ndo_start_xmit = dw1000_hybrid_net_start_xmit,
-	.ndo_get_stats64 = dev_get_tstats64,
-};
+/*
+ * 注意：此结构体在文件顶部已正确定义。
+ * 此处的重复定义是一个错误，将被删除。
+ * 正确的版本使用了自定义的 `dw1000_hybrid_get_stats64` 函数。
+ */
 
 // SPI驱动定义
 static struct spi_driver dw1000_generic_hybrid_spi_driver = {
