@@ -1,5 +1,22 @@
 #include "dw1000_generic.h"
 
+/*
+ * DW1000 DMA管理模块
+ * 
+ * 重要优化说明：
+ * 1. 使用流式DMA代替一致性DMA，提高性能
+ *    - kmalloc + dma_map_single 替代 dma_alloc_coherent
+ *    - 允许CPU缓存优化，显著提升大数据量处理性能
+ * 
+ * 2. 缓存一致性管理：
+ *    - TX: dma_sync_single_for_device() 确保CPU写入对DMA可见
+ *    - RX: dma_sync_single_for_cpu() 确保DMA数据对CPU可见
+ * 
+ * 3. 正确的内存管理顺序：
+ *    - 分配：kmalloc -> dma_map_single
+ *    - 释放：dma_unmap_single -> kfree
+ */
+
 // 初始化RX DMA描述符
 int dw1000_setup_rx_desc(struct dw1000_hybrid_priv *priv)
 {
@@ -14,14 +31,27 @@ int dw1000_setup_rx_desc(struct dw1000_hybrid_priv *priv)
     for (i = 0; i < NUM_RX_DESC; i++) {
         struct dw1000_rx_desc *desc = &priv->rx_desc[i];
         
-        // 为每个描述符分配DMA缓冲区
+        // 为每个描述符分配流式DMA缓冲区
         desc->buffer_size = RX_DESC_BUFFER_SIZE;
-        desc->buffer = dma_alloc_coherent(&priv->spi->dev, 
-                                          desc->buffer_size,
-                                          &desc->dma_addr, 
-                                          GFP_KERNEL);
+        
+        // 使用kmalloc分配可缓存的内存，提高CPU访问性能
+        // 相比dma_alloc_coherent，这种方式允许CPU缓存优化，
+        // 对于大量数据的处理可以显著提升性能
+        desc->buffer = kmalloc(desc->buffer_size, GFP_KERNEL);
         if (!desc->buffer) {
-            dev_err(&priv->spi->dev, "分配RX描述符 %d 失败\n", i);
+            dev_err(&priv->spi->dev, "分配RX缓冲区 %d 失败\n", i);
+            goto fail_cleanup;
+        }
+        
+        // 使用流式DMA映射，允许CPU缓存优化
+        desc->dma_addr = dma_map_single(&priv->spi->dev, 
+                                        desc->buffer,
+                                        desc->buffer_size,
+                                        DMA_FROM_DEVICE);
+        if (dma_mapping_error(&priv->spi->dev, desc->dma_addr)) {
+            dev_err(&priv->spi->dev, "映射RX DMA缓冲区 %d 失败\n", i);
+            kfree(desc->buffer);
+            desc->buffer = NULL;
             goto fail_cleanup;
         }
         
@@ -42,8 +72,15 @@ fail_cleanup:
     while (--i >= 0) {
         struct dw1000_rx_desc *desc = &priv->rx_desc[i];
         if (desc->buffer) {
-            dma_free_coherent(&priv->spi->dev, desc->buffer_size,
-                             desc->buffer, desc->dma_addr);
+            // 先解除DMA映射
+            if (desc->dma_addr) {
+                dma_unmap_single(&priv->spi->dev,
+                                desc->dma_addr,
+                                desc->buffer_size,
+                                DMA_FROM_DEVICE);
+            }
+            // 释放kmalloc分配的内存
+            kfree(desc->buffer);
             desc->buffer = NULL;
         }
     }
@@ -67,8 +104,15 @@ void dw1000_cleanup_rx_desc(struct dw1000_hybrid_priv *priv)
     for (i = 0; i < NUM_RX_DESC; i++) {
         struct dw1000_rx_desc *desc = &priv->rx_desc[i];
         if (desc->buffer) {
-            dma_free_coherent(&priv->spi->dev, desc->buffer_size,
-                             desc->buffer, desc->dma_addr);
+            // 先解除DMA映射
+            if (desc->dma_addr) {
+                dma_unmap_single(&priv->spi->dev,
+                                desc->dma_addr,
+                                desc->buffer_size,
+                                DMA_FROM_DEVICE);
+            }
+            // 释放kmalloc分配的内存
+            kfree(desc->buffer);
             desc->buffer = NULL;
         }
     }
@@ -101,6 +145,12 @@ int dw1000_submit_rx_desc(struct dw1000_hybrid_priv *priv, struct dw1000_rx_desc
     dma_cookie_t cookie;
     unsigned long flags;
     int ret = 0;
+    
+    // 在DMA传输前同步缓存，为DMA接收准备缓冲区
+    dma_sync_single_for_device(&priv->spi->dev,
+                              desc->dma_addr,
+                              desc->buffer_size,
+                              DMA_FROM_DEVICE);
     
     // 准备DMA描述符
     dma_desc = dmaengine_prep_slave_single(priv->rx_dma_chan,
@@ -197,6 +247,7 @@ int dw1000_setup_rx_dma(struct dw1000_hybrid_priv *priv)
         if (ret) {
             dev_err(&priv->spi->dev, "提交RX描述符 %d 失败\n", i);
             // 提交失败时，将描述符归还到free列表
+            unsigned long flags;
             spin_lock_irqsave(&priv->rx_desc_lock, flags);
             desc->in_use = false;
             list_add_tail(&desc->list, &priv->rx_free_list);
@@ -262,6 +313,12 @@ void dw1000_hybrid_dma_rx_callback(void *param)
         list_add_tail(&desc->list, &priv->rx_free_list);
         spin_unlock_irqrestore(&priv->rx_desc_lock, flags);
     } else if (status == DMA_COMPLETE) {
+        // DMA传输完成，同步缓存以便CPU访问
+        dma_sync_single_for_cpu(&priv->spi->dev,
+                               desc->dma_addr,
+                               desc->buffer_size,
+                               DMA_FROM_DEVICE);
+        
         // 成功完成时，让NAPI处理数据
         if (napi_schedule_prep(&priv->napi)) {
             __napi_schedule(&priv->napi);
@@ -284,14 +341,26 @@ static int dw1000_setup_tx_desc(struct dw1000_hybrid_priv *priv)
 	for (i = 0; i < NUM_TX_DESC; i++) {
 		struct dw1000_tx_desc *desc = &priv->tx_desc[i];
 
-		// 为每个描述符分配DMA缓冲区
+		// 为每个描述符分配流式DMA缓冲区
 		desc->buffer_size = TX_DESC_BUFFER_SIZE; // 使用定义的TX描述符缓冲区大小
-		desc->buffer = dma_alloc_coherent(&priv->spi->dev,
-										  desc->buffer_size,
-										  &desc->dma_addr,
-										  GFP_KERNEL);
+		
+		// 使用kmalloc分配可缓存的内存，提高CPU访问性能
+		// 流式DMA + CPU缓存 = 更好的性能，特别是对于频繁的数据访问
+		desc->buffer = kmalloc(desc->buffer_size, GFP_KERNEL);
 		if (!desc->buffer) {
-			dev_err(&priv->spi->dev, "Failed to allocate TX descriptor buffer %d\n", i);
+			dev_err(&priv->spi->dev, "分配TX缓冲区 %d 失败\n", i);
+			goto fail_cleanup;
+		}
+		
+		// 使用流式DMA映射，允许CPU缓存优化
+		desc->dma_addr = dma_map_single(&priv->spi->dev,
+										desc->buffer,
+										desc->buffer_size,
+										DMA_TO_DEVICE);
+		if (dma_mapping_error(&priv->spi->dev, desc->dma_addr)) {
+			dev_err(&priv->spi->dev, "映射TX DMA缓冲区 %d 失败\n", i);
+			kfree(desc->buffer);
+			desc->buffer = NULL;
 			goto fail_cleanup;
 		}
 
@@ -313,8 +382,15 @@ fail_cleanup:
 	while (--i >= 0) {
 		struct dw1000_tx_desc *desc = &priv->tx_desc[i];
 		if (desc->buffer) {
-			dma_free_coherent(&priv->spi->dev, desc->buffer_size,
-							 desc->buffer, desc->dma_addr);
+			// 先解除DMA映射
+			if (desc->dma_addr) {
+				dma_unmap_single(&priv->spi->dev,
+								desc->dma_addr,
+								desc->buffer_size,
+								DMA_TO_DEVICE);
+			}
+			// 释放kmalloc分配的内存
+			kfree(desc->buffer);
 			desc->buffer = NULL;
 		}
 	}
@@ -341,8 +417,15 @@ void dw1000_cleanup_tx_desc(struct dw1000_hybrid_priv *priv)
 	for (i = 0; i < NUM_TX_DESC; i++) {
 		struct dw1000_tx_desc *desc = &priv->tx_desc[i];
 		if (desc->buffer) {
-			dma_free_coherent(&priv->spi->dev, desc->buffer_size,
-							 desc->buffer, desc->dma_addr);
+			// 先解除DMA映射
+			if (desc->dma_addr) {
+				dma_unmap_single(&priv->spi->dev,
+								desc->dma_addr,
+								desc->buffer_size,
+								DMA_TO_DEVICE);
+			}
+			// 释放kmalloc分配的内存
+			kfree(desc->buffer);
 			desc->buffer = NULL;
 		}
 	}
@@ -425,6 +508,12 @@ int dw1000_submit_tx_desc(struct dw1000_hybrid_priv *priv, struct dw1000_tx_desc
 {
     struct dma_async_tx_descriptor *dma_desc;
     dma_cookie_t cookie;
+    
+    // 在DMA传输前同步缓存，确保CPU写入的数据对DMA可见
+    dma_sync_single_for_device(&priv->spi->dev,
+                              desc->dma_addr,
+                              desc->data_len,
+                              DMA_TO_DEVICE);
     
     // Prepare DMA descriptor
     dma_desc = dmaengine_prep_slave_single(priv->tx_dma_chan,
