@@ -401,10 +401,10 @@ static int dw1000_generic_hybrid_probe(struct spi_device *spi) {
 		goto err_device_create;
 	}
 
-	// 使用分配的缓冲区初始化 kfifo
-	if (kfifo_alloc(&priv->sensing_fifo, priv->sensing_buffer_size, GFP_KERNEL)) {
-		dev_err(&spi->dev, "分配kfifo失败\n");
-		ret = -ENOMEM;
+	// 使用分配的缓冲区初始化 kfifo（复用vmalloc的内存）
+	ret = kfifo_init(&priv->sensing_fifo, priv->sensing_buffer, priv->sensing_buffer_size);
+	if (ret) {
+		dev_err(&spi->dev, "初始化kfifo失败: %d\n", ret);
 		goto err_vmalloc;
 	}
 	
@@ -528,7 +528,7 @@ err_req_tx_chan:
 err_req_rx_chan:
 	dma_release_channel(priv->rx_dma_chan);
 err_kfifo:
-	kfifo_free(&priv->sensing_fifo);
+	// kfifo使用kfifo_init初始化，不需要kfifo_free
 err_vmalloc:
 	vfree(priv->sensing_buffer);
 err_device_create:
@@ -595,8 +595,8 @@ static int dw1000_generic_hybrid_remove(struct spi_device *spi)
 			dev_warn(&spi->dev, "mmap引用计数在移除时未归零！\n");
 		}
         
-        // 清理 kfifo
-        kfifo_free(&priv->sensing_fifo);
+        // 清理 kfifo（使用kfifo_init初始化的，只需要reset或直接跳过）
+        kfifo_reset(&priv->sensing_fifo);
         
         // 释放 vmalloc 分配的内存
         vfree(priv->sensing_buffer);
